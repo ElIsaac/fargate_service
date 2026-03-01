@@ -1,7 +1,13 @@
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 app = FastAPI()
+
+@app.get("/health", response_class=JSONResponse)
+def health():
+    return {
+        "status": "ok"
+    }
 
 @app.get("/", response_class=HTMLResponse)
 def root():
