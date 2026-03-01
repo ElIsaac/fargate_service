@@ -1,0 +1,9 @@
+version: "3.9"
+
+services:
+  app:
+    image: __ACCOUNT_ID__.dkr.ecr.us-east-2.amazonaws.com/__ECR_REPOSITORY__:__LATEST_TAG_BY_ENVIRONMENT__
+    container_name: ${CONTAINER_NAME:-test_code_build_container}
+    ports:
+      - "${PORT:-8123}:${CONTAINER_PORT:-8000}"
+    restart: unless-stopped

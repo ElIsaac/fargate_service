@@ -1,0 +1,79 @@
+version: 0.2
+
+env:
+  variables:
+    AWS_DEFAULT_REGION: "us-east-2"
+
+    ECR_REPOSITORY: "test_code_build"
+    BASE_DEPLOY_PATH: "/home/ubuntu/apps"
+    SECRETS_MANAGER_PROJECT_NAME: "test_pipeline"
+
+
+phases:
+  pre_build:
+    commands:
+      - echo "Extrayendo metadata de GitHub..."
+      - ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+      - ECR_URI="$ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com"
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_URI
+      
+      # Paso 1: Obtener nombre del repositorio de GitHub
+      # Extrae la URL del remoto y obtiene solo el nombre final sin la extension .git
+
+
+
+      # Paso 2: Extraer rama de forma dinamica
+      # la branch viene de las variables de entorno definidas en el stage builld del pipeline de CodePipeline
+      - BRANCH_TAG=$(echo "$BRANCH_NAME" | sed 's/[^a-zA-Z0-9._-]/-/g')
+      
+      # Paso 3: Construir ruta de despliegue combinando rama y nombre de repositorio
+      - GITHUB_REPO_NAME=$(basename -s .git "$FULL_GITHUB_REPO_NAME")
+      - FINAL_DEPLOY_PATH="${BASE_DEPLOY_PATH}/${BRANCH_TAG}_${GITHUB_REPO_NAME}"
+      - LATEST_TAG_BY_ENVIRONMENT="${BRANCH_TAG}-latest"
+      
+      # Paso 4: Reemplazar variables en archivos de configuracion
+      - sed -i "s|__DEPLOY_PATH__|$FINAL_DEPLOY_PATH|g" cicd/appspec.yml
+      - sed -i "s|__DEPLOY_PATH__|$FINAL_DEPLOY_PATH|g" cicd/deploy.sh
+      - sed -i "s|__ACCOUNT_ID__|$ACCOUNT_ID|g" cicd/deploy.sh
+      - sed -i "s|__ECR_REPOSITORY__|$ECR_REPOSITORY|g" cicd/deploy.sh
+      - sed -i "s|__SECRETS_MANAGER_PROJECT_NAME__|$SECRETS_MANAGER_PROJECT_NAME|g" cicd/deploy.sh
+      - sed -i "s|__LATEST_TAG_BY_ENVIRONMENT__|$LATEST_TAG_BY_ENVIRONMENT|g" cicd/deploy.sh
+      
+      # Reemplazar variables en docker-compose.yml
+      - sed -i "s|__ACCOUNT_ID__|$ACCOUNT_ID|g" docker-compose.yml
+      - sed -i "s|__ECR_REPOSITORY__|$ECR_REPOSITORY|g" docker-compose.yml
+      - sed -i "s|__LATEST_TAG_BY_ENVIRONMENT__|$LATEST_TAG_BY_ENVIRONMENT|g" docker-compose.yml
+
+
+      
+      # Definir tags de imagen Docker para ECR
+      - REPO_LATEST="$ECR_URI/$ECR_REPOSITORY:$LATEST_TAG_BY_ENVIRONMENT"
+      - REPO_BUILD="$ECR_URI/$ECR_REPOSITORY:${BRANCH_TAG}-v${CODEBUILD_BUILD_NUMBER}-${COMMIT_HASH}"
+      - REPO_CACHE="$ECR_URI/$ECR_REPOSITORY:cache-${BRANCH_TAG}"
+
+      - docker buildx create --use || true
+
+  build:
+    commands:
+      - echo "Construyendo imagen para rama $BRANCH_TAG..."
+      # Usar sintaxis multilinea de YAML para el comando docker buildx
+      - |
+        docker buildx build \
+          --cache-from "type=registry,ref=$REPO_CACHE" \
+          --cache-to "type=registry,ref=$REPO_CACHE,mode=max" \
+          -t "$REPO_LATEST" \
+          -t "$REPO_BUILD" \
+          --push .
+
+  post_build:
+    commands:
+      - echo "Build y push completados."
+      - echo "Tags generados:"
+      - echo "$REPO_LATEST"
+      - echo "$REPO_BUILD"
+
+artifacts:
+  files:
+    - cicd/**/*
+    - docker-compose.yml
+  name: deployment-artifacts

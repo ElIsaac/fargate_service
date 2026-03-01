@@ -1,0 +1,15 @@
+version: 0.0
+files:
+  - source: docker-compose.yml
+    destination: __DEPLOY_PATH__/
+  - source: cicd
+    destination: __DEPLOY_PATH__/cicd/
+hooks:
+  BeforeInstall:
+    - location: cicd/detect_environment.sh
+      timeout: 300
+      runas: ubuntu
+  ApplicationStart:
+    - location: cicd/deploy.sh
+      timeout: 300
+      runas: ubuntu
