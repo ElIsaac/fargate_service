@@ -12,25 +12,18 @@ phases:
       - ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
       - ECR_URI="$ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com"
       - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_URI
-      
       - echo "Preparando tags..."
-      # Si BRANCH_NAME no está definida (ej. build manual), usamos 'latest' por defecto
       - BRANCH_TAG=$(echo "${BRANCH_NAME:-latest}" | sed 's/[^a-zA-Z0-9._-]/-/g')
       - REPO_LATEST="$ECR_URI/$ECR_REPOSITORY:${BRANCH_TAG}"
-      
-      # Habilitar Buildx para mejorar la velocidad con caché
       - docker buildx create --use || true
 
   build:
     commands:
-      - echo "Construyendo imagen: $REPO_LATEST"
-      - |
-        docker buildx build \
-          --platform linux/amd64 \
-          -t "$REPO_LATEST" \
-          --push .
+      - echo "Construyendo imagen para $REPO_LATEST..."
+      # Escrito en una sola línea para evitar errores de indentación de YAML
+      - docker buildx build --platform linux/amd64 -t "$REPO_LATEST" --push .
 
   post_build:
     commands:
       - echo "¡Listo! La imagen ya está en ECR."
-      - echo "URL de la imagen: $REPO_LATEST"
+      - echo "URL de la imagen -> $REPO_LATEST"
