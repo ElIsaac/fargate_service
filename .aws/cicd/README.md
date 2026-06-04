@@ -1,18 +1,22 @@
 # CI/CD Pipeline — fargate_service
 
-App FastAPI simple desplegada vía CodePipeline → CodeBuild → CodeDeploy sobre EC2.
+App FastAPI desplegada vía CodePipeline → CodeBuild → **Amazon ECS (Fargate)**.
 
 ## Flujo general
 
 ```
 GitHub (push) → CodePipeline → CodeBuild (buildspec.yml)
-                                    ↓ build + push a ECR
+                                    ↓ build + push a ECR + genera imagedefinitions.json
                                CodeBuild (buildspec-testing.yml)
                                     ↓ pull + smoke tests (pytest)
-                               CodeDeploy (appspec.yml + deploy.sh)
-                                    ↓ pull + docker compose up
-                                   EC2
+                               Deploy: acción "Amazon ECS" (Rolling)
+                                    ↓ nueva revisión de Task Definition + update del Service
+                                ECS Fargate (detrás de un ALB)
 ```
+
+A diferencia del deploy a EC2 (CodeDeploy + `docker compose`), en Fargate **no hay
+instancia ni `deploy.sh`**: ECS corre el contenedor a partir de una Task Definition,
+y la acción de deploy solo le indica qué imagen usar (`imagedefinitions.json`).
 
 ---
 
@@ -21,43 +25,85 @@ GitHub (push) → CodePipeline → CodeBuild (buildspec.yml)
 ```
 .aws/
 ├── cicd/
-│   ├── buildspec.yml          # Build: construye y sube imagen a ECR
+│   ├── buildspec.yml          # Build: construye, sube a ECR y genera imagedefinitions.json
 │   ├── buildspec-testing.yml  # Testing: levanta el contenedor y corre pytest
-│   ├── appspec.yml            # Deploy: instrucciones para CodeDeploy
-│   ├── deploy.sh              # Script ejecutado en EC2 al desplegar
 │   └── README.md
+├── ecs/
+│   └── taskdef.json           # Plantilla de Task Definition (referencia para crear la infra)
 ├── tests/
 │   ├── conftest.py            # Fixture: exige TESTING_BASE_URL
 │   └── test_smoke.py          # Smoke E2E contra /health, / y el catch-all
-docker-compose.yml             # Definición del contenedor en producción
+docker-compose.yml             # Solo para uso local (no se usa en prod con Fargate)
 ```
 
 ---
 
-## Crear un nuevo pipeline
+## Parte 1 — Infraestructura de ECS (se crea UNA vez)
 
-### Paso 1 — Clonar pipeline plantilla
+El pipeline asume que esto ya existe. Pasos mínimos (region `us-east-2`):
 
-En la consola de AWS CodePipeline, clonar según el ambiente:
+### 1.1 — Repositorio ECR
+Ya existe (`fargate_service`), creado por el build.
 
-| Ambiente | Pipeline a clonar |
-|---|---|
-| Producción | `prod_test_code_pipeline` |
-| Desarrollo / staging | `development_test_code_pipeline` |
+### 1.2 — Log group de CloudWatch
+```
+aws logs create-log-group --log-group-name /ecs/fargate_service --region us-east-2
+```
 
-### Paso 2 — Ajustar el pipeline clonado
+### 1.3 — Roles IAM
+- **Execution role** (`fargate_service-execution-role`): permite a ECS hacer pull de ECR,
+  escribir logs y leer los secrets referenciados en la task def.
+  - Policy gestionada: `AmazonECSTaskExecutionRolePolicy`
+  - + permiso `secretsmanager:GetSecretValue` sobre `prod/fargate_service`.
+- **Task role** (`fargate_service-task-role`): permisos que necesita la app en runtime
+  (vacío si la app no llama a otros servicios AWS).
 
-**Stage Source:**
-- `FullRepositoryId` → `owner/nuevo-repo`
-- `BranchName` → rama que dispara el pipeline (ej: `main`, `develop`)
-- El namespace de output variables debe llamarse `SourceVariables` (default)
+### 1.4 — Secrets Manager
+Crear el secret `prod/fargate_service`. Cada variable de entorno de la app se referencia
+desde `containerDefinitions[].secrets` en la task def (ver [taskdef.json](../ecs/taskdef.json)),
+en lugar de bajarse a un `.env`.
 
-**Trigger:**
-- `gitConfiguration.push.branches.includes` → misma rama del Source
+### 1.5 — Networking + ALB
+- VPC con subnets (privadas para los tasks, públicas para el ALB).
+- **Application Load Balancer** + **Target Group** tipo `ip` (Fargate usa `awsvpc`),
+  health check → `/health`, puerto 8000.
+- Security groups: el del ALB acepta 80/443 desde internet; el de los tasks acepta 8000
+  solo desde el SG del ALB.
 
-**Stage Build (CodeBuild):**
-- Crear un nuevo proyecto de CodeBuild apuntando a este repo
-- Verificar que estas variables de entorno estén configuradas en el stage:
+### 1.6 — Cluster + Task Definition + Service
+```
+aws ecs create-cluster --cluster-name fargate_service --region us-east-2
+
+# Registrar la task def (reemplaza __ACCOUNT_ID__ y ajusta secrets/cpu/memory):
+aws ecs register-task-definition --cli-input-json file://.aws/ecs/taskdef.json --region us-east-2
+
+# Crear el service (Fargate, detrás del target group del ALB):
+aws ecs create-service \
+  --cluster fargate_service \
+  --service-name fargate_service \
+  --task-definition fargate_service \
+  --desired-count 1 \
+  --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={subnets=[subnet-aaa,subnet-bbb],securityGroups=[sg-tasks],assignPublicIp=DISABLED}" \
+  --load-balancers "targetGroupArn=arn:aws:elasticloadbalancing:...:targetgroup/...,containerName=fargate_service,containerPort=8000" \
+  --region us-east-2
+```
+
+> El `containerName` del service y el `"name"` en `imagedefinitions.json` (variable
+> `CONTAINER_NAME` del buildspec) **deben coincidir** con el `name` del contenedor en la
+> task def. Por defecto: `fargate_service`.
+
+---
+
+## Parte 2 — Pipeline en CodePipeline
+
+### Stage Source
+- `FullRepositoryId` → `owner/repo`
+- `BranchName` → rama que dispara (ej: `main`)
+- Output variables namespace: `SourceVariables`
+
+### Stage Build (CodeBuild — buildspec.yml)
+Variables de entorno del stage:
 
 | Variable | Valor |
 |---|---|
@@ -66,139 +112,46 @@ En la consola de AWS CodePipeline, clonar según el ambiente:
 | `COMMIT_HASH` | `#{SourceVariables.CommitId}` |
 | `COMMIT_MSG` | `#{SourceVariables.CommitMessage}` |
 | `PIPELINE_EXECUTION_ID` | `#{codepipeline.PipelineExecutionId}` |
-| `DEPLOY_FOLDER` | nombre de carpeta en el servidor (ej: `fargate-service`) |
-| `DEPLOY_ENV` | `stage` o `prod` |
 
-**Stage Deploy (CodeDeploy):**
-- `InstanceTagValue` → tag `Name` de la instancia EC2 destino
+`ECR_REPOSITORY` y `CONTAINER_NAME` ya vienen como defaults en el `buildspec.yml`.
 
-### Paso 3 — Copiar `.aws/` y `docker-compose.yml` al nuevo repo
+Output artifact: `deployment-artifacts` (contiene `imagedefinitions.json`, `.aws/cicd/**`, `.aws/tests/**`).
 
-### Paso 4 — Configurar variables en `buildspec.yml`
+### Stage Testing (CodeBuild — buildspec-testing.yml)
+Input artifact: `deployment-artifacts`. Hace pull de la imagen y corre pytest.
 
-```yaml
-env:
-  variables:
-    AWS_DEFAULT_REGION: "us-east-2"
-    ECR_REPOSITORY: "fargate_service"
-    BASE_DEPLOY_PATH: "/home/ubuntu/apps"
-    SECRETS_MANAGER_PROJECT_NAME: "fargate_service"
-```
+### Stage Deploy (acción "Amazon ECS")
+- **Action provider:** Amazon ECS (Standard / Rolling)
+- **Input artifact:** `deployment-artifacts`
+- **Cluster name:** `fargate_service`
+- **Service name:** `fargate_service`
+- **Image definitions file:** `imagedefinitions.json`
 
-| Variable | Descripción |
-|---|---|
-| `ECR_REPOSITORY` | Nombre del repositorio ECR |
-| `SECRETS_MANAGER_PROJECT_NAME` | Nombre del proyecto en Secrets Manager (sin prefijo de ambiente) |
-| `BASE_DEPLOY_PATH` | Ruta base en el servidor — generalmente no cambia |
+La acción lee `imagedefinitions.json`, crea una nueva revisión de la Task Definition con
+el `imageUri` indicado y hace `UpdateService` (rolling deployment).
 
 ---
 
 ## Cómo funciona internamente
 
 ### buildspec.yml — Build
-
-**pre_build:**
-1. Valida que estén presentes todas las variables requeridas.
-2. Login a ECR con `aws ecr get-login-password`.
-3. Calcula variables derivadas:
-
-| Variable | Valor |
-|---|---|
-| `BRANCH_TAG` | rama sanitizada (no alfanumérico → `-`) |
-| `FINAL_DEPLOY_PATH` | `BASE_DEPLOY_PATH/DEPLOY_FOLDER` |
-| `HASH_TAG_BY_ENVIRONMENT` | `{BRANCH_TAG}-{7 chars del commit}-v{BUILD_NUMBER}` |
-
-4. Reemplaza placeholders con `sed` en `appspec.yml`, `deploy.sh`, `docker-compose.yml`, `buildspec-testing.yml`.
-
-**build:** construye y sube la imagen con `docker buildx` (cache de registry en ECR):
-
-| Tag | Propósito |
-|---|---|
-| `{BRANCH_TAG}-{SHORT_HASH}-v{BUILD_NUMBER}` | Tag principal (por commit + build) |
-| `{BRANCH_TAG}-v{BUILD_NUMBER}` | Trazabilidad por número de build |
-| `latest-{BRANCH_TAG}` | Pull rápido |
-| `cache-{BRANCH_TAG}` | Cache de capas para builds futuros |
-
-**Artefactos a las siguientes etapas:** `.aws/cicd/**/*`, `.aws/tests/**/*`, `docker-compose.yml` (ya con placeholders reemplazados).
+1. Valida variables requeridas y hace login a ECR.
+2. Calcula tags (`{BRANCH_TAG}-{SHORT_HASH}-v{BUILD_NUMBER}`, etc.).
+3. Inyecta variables en `buildspec-testing.yml` (la etapa de testing hace pull).
+4. `docker buildx build --push` con cache de registry en ECR.
+5. Genera `imagedefinitions.json` apuntando al tag inmutable por build.
 
 ### buildspec-testing.yml — Testing
-
-Esta app **no requiere secretos ni autenticación para arrancar**, por lo que el testing es directo:
-
-1. Levanta Docker-in-Docker (DinD) con storage driver `vfs`.
-2. Login a ECR + pull de la imagen recién construida (`HASH_TAG_BY_ENVIRONMENT`).
-3. `docker run` exponiendo el puerto `8000` (el que escucha el contenedor, ver `Dockerfile`).
-4. Espera hasta que `http://localhost:8000/health` responda (timeout 30s).
-5. Ejecuta `pytest .aws/tests/test_smoke.py` y publica `report.xml` (JUnit).
-6. Limpia el contenedor.
-
-### appspec.yml — Deploy
-
-CodeDeploy copia los artefactos al servidor y ejecuta:
-
-```
-ApplicationStart → deploy.sh (runas: ubuntu, timeout: 300s)
-```
-
-Archivos copiados:
-- `docker-compose.yml` → `{DEPLOY_PATH}/`
-- `.aws/cicd/` → `{DEPLOY_PATH}/cicd/`
-
-### deploy.sh — Script en EC2
-
-Se ejecuta como usuario `ubuntu` (placeholders ya reemplazados por `buildspec.yml`):
-
-1. Login a ECR.
-2. Pull de la imagen `{ECR_REPOSITORY}:{HASH_TAG_BY_ENVIRONMENT}`.
-3. Descarga el secret `{DEPLOY_ENV}/{SECRETS_MANAGER_PROJECT_NAME}` y vuelca su clave `container_env` a un archivo `.env` junto al compose (lo auto-carga `docker compose` para resolver `${PORT}`, `${CONTAINER_NAME}`, `${CONTAINER_PORT}`).
-4. `docker compose up -d --wait --remove-orphans`.
-5. `docker image prune -f`.
-
-Placeholders que reemplaza `buildspec.yml`:
-
-| Placeholder | Reemplazado por |
-|---|---|
-| `__ACCOUNT_ID__` | ID de la cuenta AWS |
-| `__ECR_REPOSITORY__` | Nombre del repo ECR |
-| `__SECRETS_MANAGER_PROJECT_NAME__` | Nombre del proyecto |
-| `__DEPLOY_PATH__` | Ruta final de despliegue |
-| `__DEPLOY_ENV__` | Ambiente (`stage` o `prod`) |
-| `__HASH_TAG_BY_DEPLOY_ENV__` | Tag de la imagen a desplegar |
+Levanta Docker-in-Docker, hace pull de la imagen recién construida, la corre exponiendo
+el puerto 8000, espera a `/health` y ejecuta `pytest .aws/tests/test_smoke.py`.
 
 ---
 
-## Secrets Manager — Estructura requerida
-
-```
-{DEPLOY_ENV}/{SECRETS_MANAGER_PROJECT_NAME}   ← variables de la app
-```
-
-El secret es un JSON con la clave `container_env`, que `deploy.sh` convierte en el
-`.env` que consume `docker-compose.yml`. Mínimo requerido:
-
-```json
-{
-  "container_env": {
-    "PORT": "8123",
-    "CONTAINER_NAME": "fargate_service",
-    "CONTAINER_PORT": "8000"
-  }
-}
-```
-
-> A diferencia de proyectos con login, esta app no necesita el secret
-> `testing_credentials`: la suite de smoke no autentica.
-
----
-
-## Requisitos de la instancia EC2
-
-- Tag `Name` que coincida con `InstanceTagValue` en el pipeline
-- Docker y docker-compose instalados
-- AWS CLI configurado
-- Usuario `ubuntu` con permisos sudo
-- CodeDeploy Agent instalado y corriendo
-- Instance Profile con permisos para: ECR, Secrets Manager
+## Permisos del rol de servicio de CodePipeline
+Para la acción de deploy a ECS, el rol de CodePipeline necesita además:
+`ecs:DescribeServices`, `ecs:DescribeTaskDefinition`, `ecs:DescribeTasks`,
+`ecs:ListTasks`, `ecs:RegisterTaskDefinition`, `ecs:UpdateService`, y `iam:PassRole`
+sobre los roles de la task (execution role y task role).
 
 ---
 
@@ -206,9 +159,9 @@ El secret es un JSON con la clave `container_env`, que `deploy.sh` convierte en 
 
 | Dónde | Qué cambiar |
 |---|---|
-| `buildspec.yml` | `ECR_REPOSITORY`, `SECRETS_MANAGER_PROJECT_NAME`, `BASE_DEPLOY_PATH` |
+| `buildspec.yml` | `ECR_REPOSITORY`, `CONTAINER_NAME` |
+| `.aws/ecs/taskdef.json` | `family`, `name`, secrets, cpu/memory, roles |
 | Pipeline → Source | Repositorio y rama |
-| Pipeline → Trigger | Rama que dispara el pipeline |
-| Pipeline → Build | Nuevo proyecto CodeBuild + variables de entorno |
-| Pipeline → Deploy | `InstanceTagValue` (tag Name del EC2) |
-| Secrets Manager | Crear `stage/…` y `prod/…` con la clave `container_env` |
+| Pipeline → Build | Variables de entorno del stage |
+| Pipeline → Deploy | Cluster name, Service name |
+| Infra ECS | Cluster, Task Def, Service, ALB, roles, secret |
